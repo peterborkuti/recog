@@ -1,57 +1,76 @@
 import cv2
 import numpy as np
 import json
-from enum import Enum
 from typing import TypedDict
 import functools
-
-# Function to detect shapes
+from abc import ABC, abstractmethod #Abstract Base Classes
 
 
 def transform(frame):
     frame = cv2.flip(frame, -1)
     return frame
 
+def quantize(threshold: int, x):
+    return (int(x)//threshold) * threshold
 
 # BGR
 BLUE = (255, 0, 0)
 GREEN = (0, 255, 0)
 RED = (0, 0, 255)
 
+class Shape(ABC):
+    params: any
+    quantizer: any
 
-class Shape:
-    coord: tuple[int, int]
-    params: list[int]
+    def correct(self, l: any) -> any:
+        return self.quantizer(l)
 
-    def correct(self, l: list[float]) -> list[int]:
-        return list(map(lambda x: (int(x)//5)*5, l))
-
-    def lists_equals(l1: list[int], l2: list[int]) -> bool:
-        if len(l1) != len(l2):
-            return False
-
-    def __init__(self, x: float, y: float, args: list[float]) -> None:
-        self.coord = self.correct([x, y])
+    def __init__(self, args: any) -> None:
         self.params = self.correct(args)
 
     def __eq__(self, other):
         if isinstance(other, Shape):
-            l1 = list(self.coord) + self.params
-            l2 = list(other.coord) + other.params
-            return functools.reduce(lambda x, y: x and y, map(lambda p, q: p == q, l1, l2), True)
+            if self.params.shape != other.params.shape:
+                return False
+
+            return (self.params == other.params).all()
 
         return False
+
+    @abstractmethod
+    def draw(self, image, intensity: int):
+        pass
 
 
 class Circle(Shape):
     def __init__(self, x: float, y: float, r: float) -> None:
-        super().__init__(x, y, [r])
+        self.quantizer = np.vectorize(functools.partial(quantize, 5))
+        super().__init__(np.array([x, y, r]))
 
     def __eq__(self, other):
         if isinstance(other, Circle):
             return super().__eq__(other)
 
         return False
+
+    def draw(self, image, intensity):
+        cv2.circle(image, (self.params[0], self.params[1]),
+                   self.params[2], (0, 0, intensity), 2)
+
+
+class Rectangle(Shape):
+    def __init__(self, params) -> None:
+        self.quantizer = np.vectorize(functools.partial(quantize, 70))
+        super().__init__(params)
+
+    def __eq__(self, other):
+        if isinstance(other, Rectangle):
+            return super().__eq__(other)
+
+        return False
+
+    def draw(self, image, intensity):
+        cv2.drawContours(image, [self.params], 0, (0, 0, intensity), 2)
 
 
 class StoredShape(TypedDict):
@@ -60,45 +79,62 @@ class StoredShape(TypedDict):
     updated: bool
 
 
-circles: list[StoredShape] = []
+shapes: list[StoredShape] = []
+
+
+def update_detected_shape(shape: Shape):
+    found_index = next(iter(i for (i, s) in enumerate(
+        shapes) if s['shape'] == shape), None)
+    if (found_index == None):
+        print('add shape %s' % type(shape))
+        print(shape.params)
+        shapes.append({'shape': shape, 'probability': 0.1, 'updated': True})
+    else:
+        print('increase probablitity of %s' % type(shape))
+        sShape = shapes[found_index]
+        sShape['probability'] = (1.0 + sShape['probability']) / 2
+        sShape['updated'] = True
 
 
 def found_circle(data: tuple[any, float]) -> None:
     (x, y), r = data
-    circle = Circle(x, y, r)
-    found_index = next(iter(i for (i, c) in enumerate(
-        circles) if c['shape'] == circle), None)
-    if (found_index == None):
-        circles.append({'shape': circle, 'probability': 0.1, 'updated': True})
-    else:
-        sCircle = circles[found_index]
-        sCircle['probability'] = (1.0 + sCircle['probability']) / 2
-        sCircle['updated'] = True
+    if r < 5:
+        return
+
+    update_detected_shape(Circle(x, y, r))
 
 
-def update_not_found_circles() -> None:
-    for i, sShape in enumerate(circles):
+def found_rectangle(box) -> None:
+    update_detected_shape(Rectangle(box))
+
+
+def update_not_found_shapes() -> None:
+    for i, sShape in enumerate(shapes):
         if not sShape['updated']:
             sShape['probability'] /= 2.0
         sShape['updated'] = False
 
-    filteredCircles = list(filter(lambda ss: ss['probability'] >= 0.1, circles))
-    circles.clear()
-    circles.extend(filteredCircles)
+    filteredShapes = list(filter(lambda ss: ss['probability'] >= 0.1, shapes))
+    shapes.clear()
+    shapes.extend(filteredShapes)
 
 
-def draw_circles(frame) -> None:
-    print(circles)
-    for sCircle in circles:
-        circle = sCircle['shape']
-        cv2.circle(frame, circle.coord, circle.params[0], RED, 2)
+def draw_shapes(frame):
+    height, width, channels = frame.shape
+    blank_image = np.zeros((height, width, 3), np.uint8)
+
+    for sShape in shapes:
+        shape = sShape['shape']
+        prob = sShape['probability']
+        if prob < 0.7:
+            continue
+        intensity = int(prob * 255)
+        shape.draw(blank_image, intensity)
+
+    return blank_image
 
 
 def detect_shapes(frame):
-    # Convert to grayscale
-    # Apply GaussianBlur to reduce noise and improve contour detection
-    # blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Perform Canny edge detection
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     # (treshold, bw) = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY)
     edges = cv2.Canny(gray, 20, 100)
@@ -116,16 +152,15 @@ def detect_shapes(frame):
 
         # Check if the shape is a rectangle
         if len(approx) == 4:
-            # Compute the bounding box of the contour and draw it
-            (x, y, w, h) = cv2.boundingRect(approx)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), BLUE, 2)
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)  # Get 4 corners of the rectangle
+            found_rectangle(box)
         # Check for circles
         elif len(approx) > 4:
             # Calculate the center and radius of the contour
             found_circle(cv2.minEnclosingCircle(contour))
 
-    update_not_found_circles()
-    draw_circles(frame)
+    update_not_found_shapes()
 
     return frame
 
@@ -187,32 +222,23 @@ def load_cam_params(cap):
 
 
 def main():
-    # Initialize webcam
-
     cap = camera_on()
     mapx, mapy, roi = load_cam_params(cap)
     while True:
-        # Read a frame from the webcam
         ret, frame = cap.read()
         if not ret:
             break
 
         frame = undistort(frame, mapx, mapy, roi)
 
-        # Detect shapes in the frame
         frame = detect_shapes(frame)
+        cv2.imshow('Input', frame)
 
-        # frame = transform(frame)
-        # frame = detect_shapes(frame)
+        cv2.imshow('Output', draw_shapes(frame))
 
-        # Display the output frame
-        cv2.imshow('Shape Detection', frame)
-
-        # Break loop on 'q' key press
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Release the capture and close windows
     cap.release()
     cv2.destroyAllWindows()
 
